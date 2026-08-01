@@ -548,8 +548,60 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
 _stream_records = AccountRegionScopedDict()
+# Records dropped off the front of each table's stream, so a consumer's read
+# position stays an absolute index into the stream rather than an offset into
+# the surviving slice.
+_stream_trimmed = AccountRegionScopedDict()
 _stream_seq_counter = 0
 _stream_seq_lock = threading.Lock()
+
+# AWS DynamoDB Streams keeps records for 24 hours; retention is purely
+# time-based, so records are expired by age and by nothing else.
+_STREAM_RETENTION_SECONDS = 24 * 60 * 60
+
+
+def _record_age_cutoff(record: dict, cutoff: float) -> bool:
+    created = (record.get("dynamodb") or {}).get("ApproximateCreationDateTime", 0)
+    return created < cutoff
+
+
+def _trim_stream_records(table_name: str) -> None:
+    """Expire a table's stream records older than the retention window."""
+    records = _stream_records.get(table_name)
+    if not records:
+        return
+    cutoff = time.time() - _STREAM_RETENTION_SECONDS
+    expired = 0
+    while expired < len(records) and _record_age_cutoff(records[expired], cutoff):
+        expired += 1
+    if not expired:
+        return
+    del records[:expired]
+    _stream_trimmed[table_name] = _stream_trimmed.get(table_name, 0) + expired
+
+
+def stream_start_position(table_name: str) -> int:
+    """Oldest position still readable from a table's stream (TRIM_HORIZON)."""
+    return _stream_trimmed.get(table_name, 0)
+
+
+def stream_end_position(table_name: str) -> int:
+    """Position just past the newest record in a table's stream (LATEST)."""
+    return _stream_trimmed.get(table_name, 0) + len(_stream_records.get(table_name, []))
+
+
+def stream_records_since(table_name: str, position: int, limit: int) -> list[dict]:
+    """Read up to ``limit`` records from an absolute stream position. A position
+    behind the trim horizon resumes at the horizon, as an AWS shard iterator
+    does once its records expire."""
+    records = _stream_records.get(table_name) or []
+    offset = max(0, position - _stream_trimmed.get(table_name, 0))
+    return records[offset:offset + limit]
+
+
+def drop_stream_records(table_name: str) -> None:
+    _stream_records.pop(table_name, None)
+    _stream_trimmed.pop(table_name, None)
 
 
 def _next_stream_seq():
@@ -618,6 +670,7 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
         if table_name not in _stream_records:
             _stream_records[table_name] = []
         _stream_records[table_name].append(record)
+        _trim_stream_records(table_name)
 
     if has_kinesis:
         # AWS's Kinesis streaming destination always carries the equivalent of
@@ -1155,6 +1208,7 @@ def _delete_table(data):
     _ttl_settings.pop(name, None)
     _pitr_settings.pop(name, None)
     _kinesis_destinations.pop(name, None)
+    drop_stream_records(name)
     return json_response({"TableDescription": desc})
 
 
@@ -6133,6 +6187,7 @@ def reset():
         _ttl_settings.clear()
         _pitr_settings.clear()
         _stream_records.clear()
+        _stream_trimmed.clear()
         _kinesis_destinations.clear()
         _backups.clear()
         _contributor_insights.clear()
