@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **IoT — binary topic-rule payloads are no longer corrupted** — the rules engine built every rule event by decoding the payload as UTF-8 with `errors="replace"`, so a payload that is not valid UTF-8 reached the action with each non-ASCII byte replaced by `U+FFFD`. `encode(<expr>, 'base64')` is now supported and encodes the payload as published, so `SELECT encode(*, 'base64') AS data FROM 'telemetry'` delivers `{"data": "<base64>"}` that decodes back to the published bytes — the documented way to reach a Lambda action, which does not accept binary input. No lossy decode remains on the publish → rule → invoke path; a payload that is not valid UTF-8 and whose SELECT projects no attributes dispatches no action rather than dispatching corrupted text.
 - **IoT — topic-rule SQL is now evaluated** — the rules engine routed a publish to its actions but ignored the rule's `SELECT` clause, so a rule declaring `SELECT deviceId AS id FROM 'sensors/+/telemetry'` delivered the whole message instead of the projection. The SELECT clause is now parsed and projected — `*`, attribute paths, `AS` aliases, `topic()` / `topic(n)`, `timestamp()`, and literals, with unaliased items named as AWS names them and missing attributes omitted — for both delivery paths, Basic Ingest (where `topic()` reports the topic after the rule prefix) and a publish matching the `FROM` filter. A JSON payload under `SELECT *` still arrives as the parsed object.
 
 ## [1.4.9] — 2026-08-01
