@@ -958,7 +958,9 @@ def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
     )
     dispatched = []
 
-    def _capture_rule_action(dispatched_account_id, dispatched_region, rule, payload):
+    def _capture_rule_action(
+        dispatched_account_id, dispatched_region, rule, payload, topic=""
+    ):
         dispatched.append((dispatched_account_id, dispatched_region, rule, payload))
 
     monkeypatch.setattr(
@@ -2362,3 +2364,44 @@ def test_puback_for_first_of_multiple_in_flight():
 
     asyncio.run(_run())
     reset()
+
+
+# ----------------------------------------------------------------------
+# Rule SQL SELECT projection (white-box tests for _rule_event).
+# ----------------------------------------------------------------------
+
+def test_rule_event_select_star_returns_parsed_json():
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event("SELECT * FROM 'telemetry'", "telemetry", b'{"temp": 22}')
+    assert event == {"temp": 22}
+
+
+def test_rule_event_projects_attributes_with_aliases():
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT deviceId AS id, state.temp AS temp, topic(2) AS device "
+        "FROM 'sensors/+/telemetry'",
+        "sensors/a1/telemetry",
+        json.dumps({"deviceId": "d1", "state": {"temp": 22}}).encode(),
+    )
+    assert event == {"id": "d1", "temp": 22, "device": "a1"}
+
+
+def test_rule_event_omits_missing_attributes():
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT deviceId, absent FROM 'telemetry'", "telemetry", b'{"deviceId": "d1"}'
+    )
+    assert event == {"deviceId": "d1"}
+
+
+def test_rule_event_aliased_star_nests_the_message():
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT * AS payload FROM 'telemetry'", "telemetry", b'{"temp": 22}'
+    )
+    assert event == {"payload": {"temp": 22}}

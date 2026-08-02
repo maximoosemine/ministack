@@ -1372,6 +1372,121 @@ def _rule_topic_filter(sql: str) -> str:
     return m.group(1) if m else ""
 
 
+_MISSING = object()
+
+_SELECT_CLAUSE_RE = re.compile(r"\bSELECT\s+(.*?)\s+FROM\s+'", re.IGNORECASE | re.DOTALL)
+_SELECT_ALIAS_RE = re.compile(
+    r"^(?P<expr>.+?)\s+AS\s+(?P<alias>[A-Za-z_][\w.]*)$", re.IGNORECASE | re.DOTALL
+)
+_SELECT_FUNC_RE = re.compile(r"^(?P<name>[A-Za-z_]\w*)\s*\((?P<args>.*)\)$", re.DOTALL)
+_SELECT_ATTR_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$")
+
+
+def _rule_select_clause(sql: str) -> str:
+    """Extract the SELECT clause of a rule SQL statement."""
+    m = _SELECT_CLAUSE_RE.search(sql or "")
+    return m.group(1).strip() if m else "*"
+
+
+def _split_select_items(clause: str) -> list[str]:
+    """Split a SELECT (or function-argument) list on its top-level commas."""
+    items: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quoted = False
+    for ch in clause:
+        if quoted:
+            current.append(ch)
+            if ch == "'":
+                quoted = False
+        elif ch == "'":
+            quoted = True
+            current.append(ch)
+        elif ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            items.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        items.append(tail)
+    return [i for i in items if i]
+
+
+def _split_select_alias(item: str) -> tuple[str, str | None]:
+    m = _SELECT_ALIAS_RE.match(item.strip())
+    if m:
+        return m.group("expr").strip(), m.group("alias")
+    return item.strip(), None
+
+
+def _select_default_key(expr: str) -> str:
+    """Name an unaliased SELECT item the way AWS does — the trailing attribute
+    segment, or the function name for a function call."""
+    m = _SELECT_FUNC_RE.match(expr)
+    if m:
+        return m.group("name")
+    return expr.rsplit(".", 1)[-1]
+
+
+def _resolve_attribute(message, path: str):
+    value = message
+    for segment in path.split("."):
+        if not isinstance(value, dict) or segment not in value:
+            return _MISSING
+        value = value[segment]
+    return value
+
+
+def _eval_select_function(name: str, args: list[str], topic: str, message):
+    if name == "topic":
+        if not args:
+            return topic
+        try:
+            index = int(args[0].strip())
+        except ValueError:
+            return _MISSING
+        segments = topic.split("/")
+        if index < 1 or index > len(segments):
+            return _MISSING
+        return segments[index - 1]
+    if name == "timestamp" and not args:
+        return int(time.time() * 1000)
+    return _MISSING
+
+
+def _eval_select_expr(expr: str, topic: str, message):
+    expr = expr.strip()
+    if expr == "*":
+        return message
+    if len(expr) >= 2 and expr[0] == "'" and expr[-1] == "'":
+        return expr[1:-1]
+    m = _SELECT_FUNC_RE.match(expr)
+    if m:
+        return _eval_select_function(
+            m.group("name").lower(),
+            _split_select_items(m.group("args")),
+            topic,
+            message,
+        )
+    if _SELECT_ATTR_RE.match(expr):
+        return _resolve_attribute(message, expr)
+    try:
+        return int(expr)
+    except ValueError:
+        pass
+    try:
+        return float(expr)
+    except ValueError:
+        return _MISSING
+
+
 def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None) -> dict:
     """Store a topic rule from an API-shape (camelCase) ``TopicRulePayload``."""
     rule = {
@@ -1807,12 +1922,37 @@ def _rules_for_account(account_id: str, region: str) -> list[dict]:
     ]
 
 
-def _rule_event(payload: bytes):
-    """Decode a publish payload into a rule event (JSON, else raw text)."""
+def _rule_message(payload: bytes):
+    """Decode a publish payload into the message the SELECT clause reads."""
     try:
         return json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return (payload or b"").decode("utf-8", "replace")
+
+
+def _rule_event(sql: str, topic: str, payload: bytes):
+    """Project a publish payload through a rule's SELECT clause."""
+    payload = payload or b""
+    message = _rule_message(payload)
+    items = _split_select_items(_rule_select_clause(sql)) or ["*"]
+
+    if len(items) == 1:
+        expr, alias = _split_select_alias(items[0])
+        if expr == "*" and alias is None:
+            return message
+
+    event: dict = {}
+    for item in items:
+        expr, alias = _split_select_alias(item)
+        value = _eval_select_expr(expr, topic, message)
+        if value is _MISSING:
+            continue
+        if expr == "*" and alias is None:
+            if isinstance(value, dict):
+                event.update(value)
+            continue
+        event[alias or _select_default_key(expr)] = value
+    return event
 
 
 def _dispatch_rule_to_lambda(
@@ -1834,10 +1974,12 @@ def _dispatch_rule_to_lambda(
     ).start()
 
 
-def _run_rule_actions(account_id: str, region: str, rule: dict, payload: bytes) -> None:
+def _run_rule_actions(
+    account_id: str, region: str, rule: dict, payload: bytes, topic: str = ""
+) -> None:
     if not rule or rule.get("ruleDisabled"):
         return
-    event = _rule_event(payload)
+    event = _rule_event(rule.get("sql", ""), topic, payload)
     for action in rule.get("actions", []) or []:
         lam = action.get("lambda")
         if lam and lam.get("functionArn"):
@@ -1850,7 +1992,7 @@ def _evaluate_topic_rules(
     for rule in _rules_for_account(account_id, region):
         filter_ = _rule_topic_filter(rule.get("sql", ""))
         if filter_ and _topic_matches(filter_, topic):
-            _run_rule_actions(account_id, region, rule, payload)
+            _run_rule_actions(account_id, region, rule, payload, topic)
 
 
 async def broker_publish(
@@ -1864,12 +2006,16 @@ async def broker_publish(
     # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
     # to that rule's actions and bypasses pub/sub delivery entirely.
     if topic.startswith(_BASIC_INGEST_PREFIX):
-        rule_name = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)[0]
+        remainder = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)
+        rule_name = remainder[0]
         _run_rule_actions(
             account_id,
             region,
             _topic_rules.get_scoped(account_id, region, rule_name),
             payload,
+            # Under Basic Ingest `topic()` reports the topic after the
+            # `$aws/rules/<ruleName>/` prefix, as it does on AWS.
+            remainder[1] if len(remainder) > 1 else "",
         )
         return
 

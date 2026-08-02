@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — topic-rule SQL is now evaluated** — the rules engine routed a publish to its actions but ignored the rule's `SELECT` clause, so a rule declaring `SELECT deviceId AS id FROM 'sensors/+/telemetry'` delivered the whole message instead of the projection. The SELECT clause is now parsed and projected — `*`, attribute paths, `AS` aliases, `topic()` / `topic(n)`, `timestamp()`, and literals, with unaliased items named as AWS names them and missing attributes omitted — for both delivery paths, Basic Ingest (where `topic()` reports the topic after the rule prefix) and a publish matching the `FROM` filter. A JSON payload under `SELECT *` still arrives as the parsed object.
+
 ## [1.4.9] — 2026-08-01
 
 ### Added

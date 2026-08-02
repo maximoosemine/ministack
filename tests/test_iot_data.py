@@ -722,3 +722,25 @@ def test_iot_disabled_rule_does_not_fire(iot_client, iot_data_client, lam, sqs):
     assert _poll_sink(sqs, sink, timeout=4) is None
 
     iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_attribute_projection(iot_client, iot_data_client, lam, sqs):
+    sink = sqs.create_queue(QueueName=_unique("project-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("project").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT deviceId AS id, topic(2) AS device "
+                   "FROM 'sensors/+/telemetry'",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry",
+        payload=json.dumps({"deviceId": "d1", "temp": 22}).encode(),
+    )
+    assert _poll_sink(sqs, sink) == {"id": "d1", "device": "a1"}
+
+    iot_client.delete_topic_rule(ruleName=rule)
