@@ -561,13 +561,24 @@ _STREAM_RETENTION_SECONDS = 24 * 60 * 60
 
 
 def _record_age_cutoff(record: dict, cutoff: float) -> bool:
-    created = (record.get("dynamodb") or {}).get("ApproximateCreationDateTime", 0)
+    created = (record.get("dynamodb") or {}).get("ApproximateCreationDateTime")
+    if not created:
+        # No creation time to age against (restored or hand-built records) —
+        # keep it rather than treating it as infinitely old.
+        return False
     return created < cutoff
 
 
-def _trim_stream_records(table_name: str) -> None:
-    """Expire a table's stream records older than the retention window."""
-    records = _stream_records.get(table_name)
+def _trim_stream_records(table_name: str, *, account_id=None, region=None) -> None:
+    """Expire a table's stream records older than the retention window.
+
+    Called from the read paths as well as on write, so a stream that stopped
+    receiving records still ages out of its retention window.
+    """
+    if account_id is None or region is None:
+        records = _stream_records.get(table_name)
+    else:
+        records = _stream_records.get_scoped(account_id, region, table_name)
     if not records:
         return
     cutoff = time.time() - _STREAM_RETENTION_SECONDS
@@ -577,26 +588,59 @@ def _trim_stream_records(table_name: str) -> None:
     if not expired:
         return
     del records[:expired]
-    _stream_trimmed[table_name] = _stream_trimmed.get(table_name, 0) + expired
+    if account_id is None or region is None:
+        _stream_trimmed[table_name] = _stream_trimmed.get(table_name, 0) + expired
+    else:
+        _stream_trimmed.set_scoped(
+            account_id, region, table_name,
+            _stream_trimmed.get_scoped(account_id, region, table_name, 0) + expired,
+        )
 
 
-def stream_start_position(table_name: str) -> int:
+def _live_stream_records(table_name: str, account_id=None, region=None) -> list[dict]:
+    if account_id is None or region is None:
+        return _stream_records.get(table_name) or []
+    return _stream_records.get_scoped(account_id, region, table_name) or []
+
+
+def _trimmed_count(table_name: str, account_id=None, region=None) -> int:
+    if account_id is None or region is None:
+        return _stream_trimmed.get(table_name, 0)
+    return _stream_trimmed.get_scoped(account_id, region, table_name, 0)
+
+
+def stream_start_position(table_name: str, *, account_id=None, region=None) -> int:
     """Oldest position still readable from a table's stream (TRIM_HORIZON)."""
-    return _stream_trimmed.get(table_name, 0)
+    _trim_stream_records(table_name, account_id=account_id, region=region)
+    return _trimmed_count(table_name, account_id, region)
 
 
-def stream_end_position(table_name: str) -> int:
+def stream_end_position(table_name: str, *, account_id=None, region=None) -> int:
     """Position just past the newest record in a table's stream (LATEST)."""
-    return _stream_trimmed.get(table_name, 0) + len(_stream_records.get(table_name, []))
+    _trim_stream_records(table_name, account_id=account_id, region=region)
+    return (
+        _trimmed_count(table_name, account_id, region)
+        + len(_live_stream_records(table_name, account_id, region))
+    )
 
 
-def stream_records_since(table_name: str, position: int, limit: int) -> list[dict]:
+def stream_records_since(
+    table_name: str, position: int, limit: int, *, account_id=None, region=None
+) -> list[dict]:
     """Read up to ``limit`` records from an absolute stream position. A position
     behind the trim horizon resumes at the horizon, as an AWS shard iterator
     does once its records expire."""
-    records = _stream_records.get(table_name) or []
-    offset = max(0, position - _stream_trimmed.get(table_name, 0))
+    _trim_stream_records(table_name, account_id=account_id, region=region)
+    records = _live_stream_records(table_name, account_id, region)
+    offset = max(0, position - _trimmed_count(table_name, account_id, region))
     return records[offset:offset + limit]
+
+
+def stream_live_records(table_name: str, *, account_id=None, region=None) -> list[dict]:
+    """The table's unexpired records, oldest first. Index ``i`` in this list is
+    absolute position ``stream_start_position(...) + i``."""
+    _trim_stream_records(table_name, account_id=account_id, region=region)
+    return _live_stream_records(table_name, account_id, region)
 
 
 def drop_stream_records(table_name: str) -> None:
