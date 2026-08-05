@@ -4,6 +4,8 @@ import io
 import json
 import os
 import time
+import urllib.error as _urlerr
+import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
 from unittest.mock import patch
@@ -90,6 +92,14 @@ def _regional_client(service: str, region: str):
     )
 
 
+def _list_all_functions(lam):
+    return [
+        function
+        for page in lam.get_paginator("list_functions").paginate()
+        for function in page["Functions"]
+    ]
+
+
 def _region_marker_code(marker: str) -> bytes:
     code = f"""
 import os
@@ -171,8 +181,8 @@ def test_lambda_functions_are_region_scoped():
     assert ":us-west-2:" in west_created["FunctionArn"]
     assert east_created["FunctionArn"] != west_created["FunctionArn"]
 
-    east_names = {fn["FunctionName"] for fn in east.list_functions()["Functions"]}
-    west_names = {fn["FunctionName"] for fn in west.list_functions()["Functions"]}
+    east_names = {fn["FunctionName"] for fn in _list_all_functions(east)}
+    west_names = {fn["FunctionName"] for fn in _list_all_functions(west)}
     assert name in east_names
     assert name in west_names
 
@@ -809,8 +819,8 @@ def test_lambda_create_invoke(lam):
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
     )
-    funcs = lam.list_functions()
-    assert any(f["FunctionName"] == "test-func-1" for f in funcs["Functions"])
+    funcs = _list_all_functions(lam)
+    assert any(f["FunctionName"] == "test-func-1" for f in funcs)
     resp = lam.invoke(FunctionName="test-func-1", Payload=json.dumps({"key": "value"}))
     payload = json.loads(resp["Payload"].read())
     assert payload["statusCode"] == 200
@@ -1050,8 +1060,7 @@ def test_lambda_get_function_not_found(lam):
     assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
 
 def test_lambda_list_functions(lam):
-    resp = lam.list_functions()
-    names = [f["FunctionName"] for f in resp["Functions"]]
+    names = [f["FunctionName"] for f in _list_all_functions(lam)]
     assert "lam-create-test" in names
 
 def test_lambda_delete_function(lam):
@@ -3578,6 +3587,7 @@ def test_lambda_provided_runtime_parallel_invocations():
     per-sha extraction and spawns are serialized against extraction."""
     import concurrent.futures
     import hashlib
+
     from ministack.services import lambda_svc as lmod
 
     bootstrap_script = (
@@ -7600,6 +7610,7 @@ def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated
     storage) stored code_zip as inline base64. restore_state must accept
     that shape so an in-place upgrade requires no migration step."""
     import base64 as _b64
+
     from ministack.core.responses import AccountScopedDict
     svc, _ = lambda_svc_isolated
 
@@ -7882,6 +7893,50 @@ def test_lambda_durable_get_execution_rejects_malformed_arn(lam):
 # restarts).
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _preserved_lambda_durable_state(_ld):
+    from ministack.core.responses import AccountScopedDict
+
+    pre_index = (
+        _ld._callback_index.to_dict()
+        if hasattr(_ld._callback_index, "to_dict")
+        else dict(_ld._callback_index)
+    )
+    pre_execs = _ld._executions.to_dict()
+    pre_queue = list(_ld._resume_queue)
+    _ld._executions.clear()
+    _ld._callback_index.clear()
+    with _ld._resume_lock:
+        _ld._resume_queue.clear()
+    try:
+        yield
+    finally:
+        _ld._executions.clear()
+        _ld._executions.update(AccountScopedDict.from_dict(pre_execs))
+        _ld._callback_index.clear()
+        if hasattr(_ld._callback_index, "to_dict"):
+            _ld._callback_index.update(AccountScopedDict.from_dict(pre_index))
+        else:
+            _ld._callback_index.update(pre_index)
+        with _ld._resume_lock:
+            _ld._resume_queue.clear()
+            for e in pre_queue:
+                _ld._resume_queue.append(e)
+
+
+def _durable_restore_record(arn: str, operations: list[dict]) -> dict:
+    return {
+        "DurableExecutionArn": arn,
+        "FunctionArn": ":".join(arn.split(":")[:7]),
+        "Status": "RUNNING",
+        "Operations": operations,
+        "History": [],
+        "NextEventId": 1,
+        "CheckpointToken": "tok",
+        "InputPayload": "{}",
+    }
+
+
 def test_lambda_durable_heartbeat_extends_callback_timeout():
     """Pushing the HeartbeatDeadline forward must actually delay the
     CallbackTimedOut firing. Stale heap entries must be no-ops."""
@@ -7947,15 +8002,7 @@ def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
         "History": [], "NextEventId": 1, "CheckpointToken": "tok",
         "InputPayload": "{}",
     }
-    # Wipe live state so the test is hermetic.
-    pre_index = dict(_ld._callback_index)
-    pre_execs = dict(_ld._executions)
-    pre_queue = list(_ld._resume_queue)
-    _ld._executions.clear()
-    _ld._callback_index.clear()
-    with _ld._resume_lock:
-        _ld._resume_queue.clear()
-    try:
+    with _preserved_lambda_durable_state(_ld):
         # Pretend ministack just booted and read this rec from disk.
         _ld.restore_state({"executions": {arn: rec}})
         # Index must contain the STARTED callback.
@@ -7964,21 +8011,133 @@ def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
         # Heap must have at least one entry for this arn at or before the
         # earliest deadline (the WAIT at now+60).
         with _ld._resume_lock:
-            entries = [(t, a) for (t, a, _acct, _region) in _ld._resume_queue if a == arn]
+            entries = [e for e in _ld._resume_queue if e[1] == arn]
         assert entries, "no resume entry queued after restore"
-        assert min(t for t, _ in entries) <= now + 60 + 1
+        assert min(t for t, *_ in entries) <= now + 60 + 1
+        assert any(acct == "000000000000" and region == "us-east-1"
+                   for _t, _a, acct, region in entries)
         # And Send*Callback resolves the restored callback (no 404).
         target, op, err = _ld._resolve_callback(cb_op_id)
         assert err is None and target is rec and op["Id"] == cb_op_id
-    finally:
-        _ld._executions.clear()
-        _ld._executions.update(pre_execs)
-        _ld._callback_index.clear()
-        _ld._callback_index.update(pre_index)
+
+
+def test_lambda_durable_restore_rearms_non_boot_region_from_arn():
+    """Restored RUNNING executions must resume in their ARN's region, not
+    the boot/default region active during module import."""
+    from ministack.services import lambda_durable as _ld
+    arn = "arn:aws:lambda:us-west-2:000000000000:function:restore-west:$LATEST/durable-execution/" \
+          "11111111111111111111111111111111/22222222222222222222222222222222"
+    wait_op_id = "westwaitaaaaaaaaaaaaaaaaaaaaaaaa"
+    now = _ld._now()
+    rec = _durable_restore_record(arn, [{
+        "Id": wait_op_id, "Type": "WAIT", "Status": "STARTED",
+        "WaitDetails": {"ScheduledEndTimestamp": now + 3600, "Duration": 3600},
+    }])
+
+    with _preserved_lambda_durable_state(_ld):
+        _ld.restore_state({"executions": {arn: rec}})
         with _ld._resume_lock:
-            _ld._resume_queue.clear()
-            for e in pre_queue:
-                _ld._resume_queue.append(e)
+            entries = [e for e in _ld._resume_queue if e[1] == arn]
+        assert entries, "no resume entry queued after restore"
+        assert any(acct == "000000000000" and region == "us-west-2"
+                   for _t, _a, acct, region in entries)
+
+
+def test_lambda_durable_restore_rebuilds_non_default_account_records():
+    """Restore must rebuild callback indexes and timers for every persisted
+    account, not just the account in the import-time request context."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_durable as _ld
+
+    account_id = "111111111111"
+    region = "us-west-2"
+    arn = f"arn:aws:lambda:{region}:{account_id}:function:restore-cross:$LATEST/durable-execution/" \
+          "33333333333333333333333333333333/44444444444444444444444444444444"
+    cb_op_id = "crosscbaaaaaaaaaaaaaaaaaaaaaaaaa"
+    wait_op_id = "crosswaitaaaaaaaaaaaaaaaaaaaaaa"
+    now = _ld._now()
+    rec = _durable_restore_record(arn, [
+        {"Id": cb_op_id, "Type": "CALLBACK", "Status": "STARTED",
+         "CallbackDetails": {"CallbackId": cb_op_id,
+                             "TimeoutDeadline": now + 300}},
+        {"Id": wait_op_id, "Type": "WAIT", "Status": "STARTED",
+         "WaitDetails": {"ScheduledEndTimestamp": now + 3600, "Duration": 3600}},
+    ])
+    executions = AccountScopedDict.from_dict({(account_id, arn): rec})
+    original_account = get_account_id()
+    original_region = get_region()
+
+    with _preserved_lambda_durable_state(_ld):
+        try:
+            _ld.restore_state({"executions": executions})
+            set_request_account_id(account_id)
+            set_request_region(region)
+            assert _ld._callback_index[cb_op_id] == (arn, cb_op_id)
+            target, op, err = _ld._resolve_callback(cb_op_id)
+            assert err is None
+            assert target is rec
+            assert op["Id"] == cb_op_id
+            with _ld._resume_lock:
+                entries = [e for e in _ld._resume_queue if e[1] == arn]
+            assert entries, "no resume entry queued after restore"
+            assert any(acct == account_id and queued_region == region
+                       for _t, _a, acct, queued_region in entries)
+        finally:
+            set_request_account_id(original_account)
+            set_request_region(original_region)
+
+
+def test_lambda_durable_restore_callback_index_is_account_scoped():
+    """Same CallbackId in two accounts must remain resolvable after restore."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_durable as _ld
+
+    account_a = "111111111111"
+    account_b = "222222222222"
+    region = "us-west-2"
+    cb_op_id = "samecbaaaaaaaaaaaaaaaaaaaaaaaaa"
+    now = _ld._now()
+    arn_a = f"arn:aws:lambda:{region}:{account_a}:function:restore-a:$LATEST/durable-execution/" \
+            "55555555555555555555555555555555/66666666666666666666666666666666"
+    arn_b = f"arn:aws:lambda:{region}:{account_b}:function:restore-b:$LATEST/durable-execution/" \
+            "77777777777777777777777777777777/88888888888888888888888888888888"
+    rec_a = _durable_restore_record(arn_a, [{
+        "Id": cb_op_id, "Type": "CALLBACK", "Status": "STARTED",
+        "CallbackDetails": {"CallbackId": cb_op_id,
+                            "TimeoutDeadline": now + 300},
+    }])
+    rec_b = _durable_restore_record(arn_b, [{
+        "Id": cb_op_id, "Type": "CALLBACK", "Status": "STARTED",
+        "CallbackDetails": {"CallbackId": cb_op_id,
+                            "TimeoutDeadline": now + 300},
+    }])
+    executions = AccountScopedDict.from_dict({
+        (account_a, arn_a): rec_a,
+        (account_b, arn_b): rec_b,
+    })
+
+    original_account = get_account_id()
+    original_region = get_region()
+    with _preserved_lambda_durable_state(_ld):
+        try:
+            _ld.restore_state({"executions": executions})
+
+            set_request_account_id(account_a)
+            set_request_region(region)
+            target, op, err = _ld._resolve_callback(cb_op_id)
+            assert err is None
+            assert target is rec_a
+            assert op["Id"] == cb_op_id
+
+            set_request_account_id(account_b)
+            set_request_region(region)
+            target, op, err = _ld._resolve_callback(cb_op_id)
+            assert err is None
+            assert target is rec_b
+            assert op["Id"] == cb_op_id
+        finally:
+            set_request_account_id(original_account)
+            set_request_region(original_region)
 
 
 def test_lambda_durable_restore_skips_non_running_executions():
@@ -8000,19 +8159,37 @@ def test_lambda_durable_restore_skips_non_running_executions():
         "History": [], "NextEventId": 1, "CheckpointToken": "tok",
         "InputPayload": "{}",
     }
-    pre_index = dict(_ld._callback_index)
-    pre_execs = dict(_ld._executions)
-    _ld._executions.clear()
-    _ld._callback_index.clear()
-    try:
+    with _preserved_lambda_durable_state(_ld):
         _ld.restore_state({"executions": {arn_done: rec}})
         # SUCCEEDED callback must NOT be indexed (only STARTED ones).
         assert cb_op_id not in _ld._callback_index
-    finally:
-        _ld._executions.clear()
-        _ld._executions.update(pre_execs)
-        _ld._callback_index.clear()
-        _ld._callback_index.update(pre_index)
+
+
+def test_lambda_durable_restore_malformed_arn_falls_back_and_continues(caplog):
+    """One malformed restored ARN must not abort restore of the rest of the
+    durable state. It falls back to the persisted account and boot region."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_durable as _ld
+
+    account_id = "222222222222"
+    arn = "not-a-durable-execution-arn"
+    now = _ld._now()
+    rec = _durable_restore_record(arn, [{
+        "Id": "badwaitaaaaaaaaaaaaaaaaaaaaaaa",
+        "Type": "WAIT",
+        "Status": "STARTED",
+        "WaitDetails": {"ScheduledEndTimestamp": now + 3600, "Duration": 3600},
+    }])
+    executions = AccountScopedDict.from_dict({(account_id, arn): rec})
+
+    with _preserved_lambda_durable_state(_ld), caplog.at_level("WARNING"):
+        _ld.restore_state({"executions": executions})
+        assert "Malformed DurableExecutionArn during restore" in caplog.text
+        with _ld._resume_lock:
+            entries = [e for e in _ld._resume_queue if e[1] == arn]
+        assert entries, "no resume entry queued after malformed ARN restore"
+        assert any(acct == account_id and region == "us-east-1"
+                   for _t, _a, acct, region in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -8225,14 +8402,17 @@ def test_lambda_xray_active_injects_trace_id(lam):
     """TracingConfig.Mode=Active → handler sees a properly-formatted
     _X_AMZN_TRACE_ID (`Root=1-<8hex>-<24hex>;Parent=<16hex>;Sampled=1`)."""
     import re as _re
+
     fname = f"xray-active-{_uuid_mod.uuid4().hex[:8]}"
     _create_xray_fn(lam, fname, "Active")
     try:
         trace_id = _invoke_trace_id(lam, fname)
         assert _re.match(_XRAY_TRACE_HEADER_RE, trace_id), trace_id
     finally:
-        try: lam.delete_function(FunctionName=fname)
-        except Exception: pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_xray_passthrough_does_not_set_trace_id(lam):
@@ -8244,8 +8424,10 @@ def test_lambda_xray_passthrough_does_not_set_trace_id(lam):
     try:
         assert _invoke_trace_id(lam, fname) == "<UNSET>"
     finally:
-        try: lam.delete_function(FunctionName=fname)
-        except Exception: pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_xray_active_fresh_id_per_invocation(lam):
@@ -8253,6 +8435,7 @@ def test_lambda_xray_active_fresh_id_per_invocation(lam):
     persistent subprocess must NOT cache the env var across invocations.
     AWS contract: every Lambda invocation is a new root segment."""
     import re as _re
+
     fname = f"xray-fresh-{_uuid_mod.uuid4().hex[:8]}"
     _create_xray_fn(lam, fname, "Active")
     try:
@@ -8262,8 +8445,10 @@ def test_lambda_xray_active_fresh_id_per_invocation(lam):
         assert _re.match(_XRAY_TRACE_HEADER_RE, t2), t2
         assert t1 != t2, f"Trace ID was reused: {t1}"
     finally:
-        try: lam.delete_function(FunctionName=fname)
-        except Exception: pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_xray_does_not_leak_across_functions(lam):
@@ -8281,14 +8466,18 @@ def test_lambda_xray_does_not_leak_across_functions(lam):
         assert _invoke_trace_id(lam, fb) == "<UNSET>"
     finally:
         for f in (fa, fb):
-            try: lam.delete_function(FunctionName=f)
-            except Exception: pass
+            try:
+                lam.delete_function(FunctionName=f)
+            except Exception:
+                pass
 
 
 def test_xray_trace_id_helper_unit():
     """Direct unit test of the helper used by all executors."""
     import re as _re
+
     from ministack.services.lambda_svc import _xray_trace_id_for_invocation
+
     # PassThrough / missing → None
     assert _xray_trace_id_for_invocation({}) is None
     assert _xray_trace_id_for_invocation({"TracingConfig": {"Mode": "PassThrough"}}) is None
@@ -8311,6 +8500,7 @@ def test_xray_trace_id_helper_unit():
 
 def test_extract_zip_preserves_executable_bit():
     import tempfile
+
     from ministack.services.lambda_svc import _extract_zip_preserving_mode
 
     buf = io.BytesIO()
@@ -8337,6 +8527,7 @@ def test_extract_zip_windows_zip_keeps_default_mode():
     (external_attr high bits = 0) — we must NOT chmod them to 0, which would
     make the extracted files unreadable."""
     import tempfile
+
     from ministack.services.lambda_svc import _extract_zip_preserving_mode
 
     buf = io.BytesIO()
@@ -8390,8 +8581,8 @@ def test_lambda_durable_resume_captures_region_and_account():
     resume queue so the background resume thread (which has no request
     contextvars) re-establishes the right tenant scope. Without it, durable
     executions in a non-default region/account never resume. In-process."""
-    from ministack.services import lambda_durable as d
     from ministack.core.responses import _request_account_id, _request_region
+    from ministack.services import lambda_durable as d
 
     tok_a = _request_account_id.set("111111111111")
     tok_r = _request_region.set("eu-west-1")
@@ -8586,3 +8777,273 @@ def test_poll_dynamodb_streams_latest_anchors_past_trimmed_records(esm_poll_stat
     _lsvc._dynamodb_stream_positions.pop(esm_id, None)
     _lsvc._init_stream_position(esm_id, stream_arn, "TRIM_HORIZON")
     assert _lsvc._dynamodb_stream_positions[esm_id] == 5
+# ---------------------------------------------------------------------------
+# Function URL data plane
+# ---------------------------------------------------------------------------
+
+_FUNCTION_URL_ECHO_JS = """
+exports.handler = async (event) => ({
+  statusCode: 200,
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    version: event.version,
+    routeKey: event.routeKey,
+    rawPath: event.rawPath,
+    rawQueryString: event.rawQueryString,
+    method: event.requestContext.http.method,
+    stage: event.requestContext.stage,
+    domainName: event.requestContext.domainName,
+    body: event.body ?? null,
+    hasQueryStringParameters: "queryStringParameters" in event,
+  }),
+});
+"""
+
+_FUNCTION_URL_STREAM_JS = """
+exports.handler = awslambda.streamifyResponse(async (event, responseStream) => {
+  const stream = awslambda.HttpResponseStream.from(responseStream, {
+    statusCode: 201,
+    headers: { "content-type": "text/event-stream", "x-from-prelude": "yes" },
+  });
+  stream.write("data: one\\n\\n");
+  stream.write("data: two\\n\\n");
+  stream.end();
+});
+"""
+
+
+def _function_url_id(function_url: str) -> str:
+    """Return the URL id (first host label) of a ``FunctionUrl``."""
+    return function_url.split("://", 1)[-1].split(".", 1)[0]
+
+
+def _function_url_request(url_id: str, path="/", method="GET", data=None, headers=None):
+    """Call a Function URL through the AWS-shaped host, returning the raw response."""
+    host = f"{url_id}.lambda-url.us-east-1.localhost:{_EXECUTE_PORT}"
+    req = _urlreq.Request(f"{_endpoint}{path}", method=method, data=data)
+    req.add_header("Host", host)
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
+    return req
+
+
+def test_lambda_function_url_data_plane_invokes_with_payload_format_2(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-echo") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            req = _function_url_request(url_id, path="/orders/42?q=a%20b")
+            with _urlreq.urlopen(req) as resp:
+                assert resp.status == 200
+                payload = json.loads(resp.read())
+
+            assert payload["version"] == "2.0"
+            # Function URLs always report the $default route and stage.
+            assert payload["routeKey"] == "$default"
+            assert payload["stage"] == "$default"
+            assert payload["rawPath"] == "/orders/42"
+            assert payload["rawQueryString"] == "q=a%20b"
+            assert payload["method"] == "GET"
+            assert payload["domainName"].startswith(f"{url_id}.lambda-url.")
+            # A bodyless request omits `body` rather than sending null.
+            assert payload["body"] is None
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_omits_query_string_parameters_when_absent(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-noqs") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                payload = json.loads(resp.read())
+            assert payload["hasQueryStringParameters"] is False
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_forwards_request_body(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-post") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            req = _function_url_request(
+                url_id,
+                path="/submit",
+                method="POST",
+                data=b'{"hello":"world"}',
+                headers={"Content-Type": "application/json"},
+            )
+            with _urlreq.urlopen(req) as resp:
+                payload = json.loads(resp.read())
+            assert payload["method"] == "POST"
+            assert payload["body"] == '{"hello":"world"}'
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_path_based_addressing(lam):
+    """`/_aws/lambda-url/{urlId}/...` works where `*.localhost` won't resolve."""
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-path") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            req = _urlreq.Request(f"{_endpoint}/_aws/lambda-url/{url_id}/orders/42", method="GET")
+            with _urlreq.urlopen(req) as resp:
+                payload = json.loads(resp.read())
+            assert payload["rawPath"] == "/orders/42"
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_unknown_url_id_returns_404(lam):
+    unknown = "00000000-0000-0000-0000-000000000000"
+    with pytest.raises(_urlerr.HTTPError) as exc:
+        _urlreq.urlopen(_function_url_request(unknown))
+    assert exc.value.code == 404
+
+
+def test_lambda_function_url_data_plane_aws_iam_rejects_unsigned(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-iam") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="AWS_IAM")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with pytest.raises(_urlerr.HTTPError) as exc:
+                _urlreq.urlopen(_function_url_request(url_id))
+            assert exc.value.code == 403
+
+            signed = _function_url_request(
+                url_id, headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/lambda/aws4_request"}
+            )
+            with _urlreq.urlopen(signed) as resp:
+                assert resp.status == 200
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_applies_cors_config(lam):
+    cors = {
+        "AllowOrigins": ["https://app.example.com"],
+        "AllowMethods": ["GET", "POST"],
+        "AllowHeaders": ["content-type"],
+        "MaxAge": 600,
+    }
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-cors") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE", Cors=cors)
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            preflight = _function_url_request(
+                url_id,
+                method="OPTIONS",
+                headers={"Origin": "https://app.example.com", "Access-Control-Request-Method": "POST"},
+            )
+            with _urlreq.urlopen(preflight) as resp:
+                assert resp.status == 200
+                assert resp.headers["Access-Control-Allow-Origin"] == "https://app.example.com"
+                assert resp.headers["Access-Control-Allow-Methods"] == "GET,POST"
+                assert resp.headers["Access-Control-Max-Age"] == "600"
+
+            # An origin outside AllowOrigins gets no CORS headers, as on AWS.
+            disallowed = _function_url_request(
+                url_id, method="OPTIONS", headers={"Origin": "https://evil.example.com"}
+            )
+            with _urlreq.urlopen(disallowed) as resp:
+                assert resp.headers.get("Access-Control-Allow-Origin") is None
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_response_stream_consumes_prelude_without_streamify(lam):
+    """The prelude framing is consumed whatever produced it.
+
+    Runs on every executor: the handler returns the framed payload directly
+    rather than going through `awslambda.streamifyResponse`, which only exists
+    in the real Lambda runtime.
+    """
+    prelude = '{"statusCode":201,"headers":{"content-type":"text/event-stream","x-from-prelude":"yes"}}'
+    code = (
+        "def handler(event, context):\n"
+        f"    return {prelude!r} + '\\x00' * 8 + 'data: one\\n\\ndata: two\\n\\n'\n"
+    )
+    fname = f"fu-framed-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    try:
+        created = lam.create_function_url_config(
+            FunctionName=fname, AuthType="NONE", InvokeMode="RESPONSE_STREAM"
+        )
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                assert resp.status == 201
+                assert resp.headers["content-type"] == "text/event-stream"
+                assert resp.headers["x-from-prelude"] == "yes"
+                body = resp.read()
+            assert body == b"data: one\n\ndata: two\n\n"
+            assert b"\x00" not in body
+            assert b"statusCode" not in body
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_function_url_response_stream_without_prelude_defaults_to_200(lam):
+    """A stream carrying no prelude is served whole, with a 200."""
+    code = "def handler(event, context):\n    return 'raw stream body'\n"
+    fname = f"fu-noprelude-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    try:
+        created = lam.create_function_url_config(
+            FunctionName=fname, AuthType="NONE", InvokeMode="RESPONSE_STREAM"
+        )
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                assert resp.status == 200
+                assert resp.read() == b"raw stream body"
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_function_url_response_stream_consumes_prelude(lam):
+    """RESPONSE_STREAM status/headers come from the prelude, and it never reaches the body.
+
+    `awslambda.streamifyResponse` is provided by the Lambda runtime interface
+    client, so this end-to-end variant needs the Docker executor.
+    """
+    with _nodejs_lambda(lam, _FUNCTION_URL_STREAM_JS, prefix="fu-stream", runtime="nodejs22.x") as fname:
+        created = lam.create_function_url_config(
+            FunctionName=fname, AuthType="NONE", InvokeMode="RESPONSE_STREAM"
+        )
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                assert resp.status == 201
+                assert resp.headers["content-type"] == "text/event-stream"
+                assert resp.headers["x-from-prelude"] == "yes"
+                body = resp.read()
+            assert body == b"data: one\n\ndata: two\n\n"
+            # The eight-NUL separator and the JSON prelude must be consumed.
+            assert b"\x00" not in body
+            assert b"statusCode" not in body
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)

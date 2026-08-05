@@ -1930,8 +1930,9 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 # ---------------------------------------------------------------------------
 
 def _execute_map(state_def, raw_input, execution, ctx):
+    # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
+    # is applied per item below -- and ItemsPath must resolve against the untransformed input
     effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective, ctx)
 
     items_path = state_def.get("ItemsPath", "$")
     items = _resolve_path(items_path, effective)
@@ -4642,7 +4643,6 @@ _QUERY_PARAM_NAME_OVERRIDES = {
     },
     ("ec2", "CreateSecurityGroup"): {
         "Description": "GroupDescription",
-        "VpcId": "VpcId",
     },
 }
 
@@ -4669,19 +4669,24 @@ def _sfn_key_to_api_name(name):
     return "".join(t.upper() if t in _AWS_ACRONYMS else t for t in tokens)
 
 
-def _convert_params_to_api_names(data, name_overrides=None):
-    """Recursively convert SFN SDK-style param names to AWS wire-format names."""
+def _convert_params_to_api_names(data, name_overrides=None, expand_acronyms=True):
+    """Recursively convert SFN SDK-style param names to AWS wire-format names.
+
+    ``expand_acronyms=False`` for services like EC2 whose wire names carry no uppercase acronym.
+    """
     if isinstance(data, dict):
         converted = {}
         for key, value in data.items():
             if name_overrides and key in name_overrides:
                 wire_key = name_overrides[key]
-            else:
+            elif expand_acronyms:
                 wire_key = _sfn_key_to_api_name(key)
-            converted[wire_key] = _convert_params_to_api_names(value, name_overrides)
+            else:
+                wire_key = key
+            converted[wire_key] = _convert_params_to_api_names(value, name_overrides, expand_acronyms)
         return converted
     if isinstance(data, list):
-        return [_convert_params_to_api_names(item, name_overrides) for item in data]
+        return [_convert_params_to_api_names(item, name_overrides, expand_acronyms) for item in data]
     return data
 
 
@@ -4758,30 +4763,6 @@ def _query_item_list(value):
     return value if isinstance(value, list) else [value]
 
 
-def _normalize_ec2_security_group(group):
-    if not isinstance(group, dict):
-        return group
-    if "groupDescription" in group:
-        group["Description"] = group.pop("groupDescription")
-    if "tagSet" in group:
-        group["Tags"] = _query_item_list(group.pop("tagSet"))
-
-    for permission_key in ("ipPermissions", "ipPermissionsEgress"):
-        if permission_key not in group:
-            continue
-        permissions = _query_item_list(group[permission_key])
-        for permission in permissions:
-            if not isinstance(permission, dict):
-                continue
-            for list_key in ("ipRanges", "ipv6Ranges", "prefixListIds"):
-                if list_key in permission:
-                    permission[list_key] = _query_item_list(permission[list_key])
-            if "groups" in permission:
-                permission["UserIdGroupPairs"] = _query_item_list(permission.pop("groups"))
-        group[permission_key] = permissions
-    return group
-
-
 def _normalize_sqs_attribute_map(result):
     """Repeated <Attribute><Name>/<Value> children as the SDK's Attributes map."""
     items = result if isinstance(result, list) else [result]
@@ -4791,6 +4772,120 @@ def _normalize_sqs_attribute_map(result):
             attributes[item["Name"]] = item.get("Value", "")
     return {"Attributes": attributes}
 
+# EC2 reuses some names depending on parent. Special case for flattening
+_EC2_FIELDS_BY_PARENT = {
+    ("attachmentSet", "status"): "State",
+    ("instancesSet", "groupSet"): "SecurityGroups",
+    ("instancesSet", "reason"): "StateTransitionReason",
+    ("ipPermissions", "groups"): "UserIdGroupPairs",
+    ("ipPermissionsEgress", "groups"): "UserIdGroupPairs",
+    ("productCodes", "productCode"): "ProductCodeId",
+    ("productCodes", "type"): "ProductCodeType",
+    ("volumeSet", "status"): "State",
+}
+
+# EC2 reuses some names depending on action. Special case for flattening
+_EC2_FIELDS_BY_ACTION = {
+    ("AttachVolume", "status"): "State",
+    ("CreateVolume", "status"): "State",
+    ("DetachVolume", "status"): "State",
+    ("StartInstances", "instancesSet"): "StartingInstances",
+    ("StopInstances", "instancesSet"): "StoppingInstances",
+    ("TerminateInstances", "instancesSet"): "TerminatingInstances",
+}
+
+
+# Elements whose SDK plural is not "<name minus Set> + s".
+_EC2_GENERIC_NAME_OVERRIDES = {
+    # Members that keep the Set suffix
+    "cidrBlockAssociationSet": "CidrBlockAssociationSet",
+    "ipv6CidrBlockAssociationSet": "Ipv6CidrBlockAssociationSet",
+    # Members whose SDK name the suffix rule cannot reach at all.
+    "keySet": "KeyPairs",
+    "volumeModificationSet": "VolumesModifications",
+    "fleetInstanceSet": "Instances",
+    "groupDescription": "Description",
+    "instanceState": "State",
+    "blockDeviceMapping": "BlockDeviceMappings",
+    "securityGroupInfo": "SecurityGroups",
+    "dnsName": "PublicDnsName",
+    "ipAddress": "PublicIpAddress",
+}
+
+_EC2_GENERIC_NUMERIC_FIELDS = frozenset({
+    "size", "iops", "throughput", "code", "coreCount", "threadsPerCore",
+    "amiLaunchIndex", "fromPort", "toPort", "volumeSize", "deviceIndex",
+    "partitionNumber", "ruleNumber", "port",
+})
+
+_EC2_GENERIC_BOOLEAN_FIELDS = frozenset({
+    "encrypted", "multiAttachEnabled", "deleteOnTermination", "sourceDestCheck",
+    "ebsOptimized", "enaSupport", "fastRestored", "isDefault", "default",
+    "mapPublicIpOnLaunch", "enableDnsSupport", "enableDnsHostnames", "primary",
+    "associatePublicIpAddress", "egress", "return", "requesterManaged",
+})
+
+# Members that are arrays even though they don't end with Set
+_EC2_LIST_FIELDS = frozenset({
+    "blockDeviceMapping", "groups", "ipPermissions", "ipPermissionsEgress",
+    "ipRanges", "ipv6Ranges", "prefixListIds", "productCodes", "securityGroupInfo",
+})
+
+def _ec2_generic_sdk_name(wire_name, action=None, parent=""):
+    """SDK member name for a wire element: context first, then the flat rules."""
+    if not wire_name:
+        return wire_name
+    # Special case for scoped fields
+    scoped = _EC2_FIELDS_BY_PARENT.get((parent, wire_name))
+    if scoped is None:
+        scoped = _EC2_FIELDS_BY_ACTION.get((action, wire_name)) if not parent else None
+    if scoped is not None:
+        return scoped
+
+    if wire_name in _EC2_GENERIC_NAME_OVERRIDES:
+        return _EC2_GENERIC_NAME_OVERRIDES[wire_name]
+    if wire_name.endswith("Set") and len(wire_name) > 3:
+        # The member is the base, pluralised. A base already in the plural is left alone
+        # (instancesSet -> Instances); the rest follow English, so Entry -> Entries and
+        # InstanceStatus -> InstanceStatuses rather than Entrys and InstanceStatus.
+        base = wire_name[:-3]
+        base = base[0].upper() + base[1:]
+        if base.endswith("y") and base[-2:-1].lower() not in "aeiou":
+            return base[:-1] + "ies"
+        if base.lower().endswith(("us", "ss", "x", "z", "ch", "sh")):
+            return base + "es"
+        return base if base.endswith("s") else base + "s"
+    return wire_name[0].upper() + wire_name[1:]
+
+def _apply_ec2_generic(wire_key, value, action=None, parent=""):
+    """Shape one wire element into its SDK form with the current type."""
+
+    # An empty element parses to {} with some XML readers and "" with others.
+    if not value and (wire_key.endswith("Set") or wire_key in _EC2_LIST_FIELDS):
+        return []
+    if isinstance(value, dict):
+        # Flatten wrapped list
+        if set(value) == {"item"}:
+            return [_apply_ec2_generic(wire_key, item, action, parent)
+                    for item in _query_item_list(value)]
+
+        return {_ec2_generic_sdk_name(k, action, wire_key): _apply_ec2_generic(k, v, action, wire_key)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_apply_ec2_generic(wire_key, item, action, parent) for item in value]
+
+    # Convert int and bool.
+    if wire_key in _EC2_GENERIC_NUMERIC_FIELDS and isinstance(value, str) and value.strip():
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if wire_key in _EC2_GENERIC_BOOLEAN_FIELDS:
+        return {"true": True, "false": False}.get(value, value)
+
+    # Return element as str is default
+    return value
+
 
 def _normalize_query_response(service_key, action, result):
     # GetQueueAttributes is the one Query result that arrives as a list, so it is
@@ -4799,18 +4894,14 @@ def _normalize_query_response(service_key, action, result):
         return _normalize_sqs_attribute_map(result)
     if not isinstance(result, dict):
         return result
-    if service_key == "ec2" and action == "DescribeSecurityGroups":
-        raw_groups = result.pop("securityGroupInfo", None)
-        if raw_groups is not None:
-            if isinstance(raw_groups, dict) and "item" in raw_groups:
-                raw_groups = raw_groups["item"]
-            if raw_groups == "":
-                groups = []
-            elif isinstance(raw_groups, list):
-                groups = raw_groups
-            else:
-                groups = [raw_groups]
-            result["SecurityGroups"] = [_normalize_ec2_security_group(group) for group in groups]
+    if service_key == "ec2":
+        shaped = {}
+        for wire_key, value in result.items():
+            if wire_key.lower() == "requestid":
+                continue
+            shaped[_ec2_generic_sdk_name(wire_key, action)] = _apply_ec2_generic(
+                wire_key, value, action)
+        return shaped
     return result
 
 
@@ -4835,7 +4926,8 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     # Convert SFN SDK-style param names (DbSubnetGroupName) to wire-format
     # names (DBSubnetGroupName) before flattening to query params.
     name_overrides = _QUERY_PARAM_NAME_OVERRIDES.get((service_key, pascal_action))
-    wire_data = _convert_params_to_api_names(input_data, name_overrides)
+    # EC2 is the exception: its serialiser only capitalises the first letter
+    wire_data = _convert_params_to_api_names(input_data, name_overrides, expand_acronyms=service_key != "ec2")
     form_params = {"Action": pascal_action}
     if service_key == "ec2":
         form_params.update(_flatten_ec2_query_params(wire_data, action=pascal_action))
