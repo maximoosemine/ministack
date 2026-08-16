@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudFormation — `AWS::IoT::Policy` updates apply instead of rolling the stack back** — the type had a create and a delete but no update handler, so a stack update fell through to create, hit `ResourceAlreadyExistsException` on the policy it had provisioned itself, and rolled back with the document unchanged: an IoT policy could be deployed once and never edited again. A changed `PolicyDocument` is now a no-interruption update stored as a new policy version and made the default, so `Ref` keeps naming the same policy and `GetPolicy` returns the new document; a changed `PolicyName` is a replacement, creating the policy under the new name and removing the old one.
+
 ## [1.4.19] — 2026-08-16
 
 ### Added

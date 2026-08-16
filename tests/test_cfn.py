@@ -552,6 +552,73 @@ def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
     _wait_stack(cfn, "cfn-iot-cog")
 
 
+def test_cfn_iot_policy_document_update_applies_in_place(cfn, iot_client):
+    """A changed PolicyDocument updates the policy instead of rolling the stack
+    back: IoT stores a new default version and Ref keeps the same name."""
+    def template(actions):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": "cfn-pol-upd",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": actions, "Resource": "*"}]}}}},
+            "Outputs": {"Name": {"Value": {"Ref": "Pol"}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-pol-upd", TemplateBody=template(["iot:Connect"]))
+    assert _wait_stack(cfn, "cfn-iot-pol-upd")["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.update_stack(
+        StackName="cfn-iot-pol-upd",
+        TemplateBody=template(["iot:Connect", "iot:Publish"]),
+    )
+    stack = _wait_stack(cfn, "cfn-iot-pol-upd")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    ) == "cfn-pol-upd"
+
+    policy = iot_client.get_policy(policyName="cfn-pol-upd")
+    assert json.loads(policy["policyDocument"])["Statement"][0]["Action"] == [
+        "iot:Connect", "iot:Publish",
+    ]
+    assert policy["defaultVersionId"] == "2"
+    versions = iot_client.list_policy_versions(policyName="cfn-pol-upd")["policyVersions"]
+    assert {v["versionId"] for v in versions} == {"1", "2"}
+
+    cfn.delete_stack(StackName="cfn-iot-pol-upd")
+    _wait_stack(cfn, "cfn-iot-pol-upd")
+
+
+def test_cfn_iot_policy_rename_replaces_the_policy(cfn, iot_client):
+    """Renaming is a replacement — the new policy exists under the new name and
+    the old one does not survive the update."""
+    def template(name):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": name,
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}}}},
+            "Outputs": {"Name": {"Value": {"Ref": "Pol"}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-pol-ren", TemplateBody=template("cfn-pol-before"))
+    assert _wait_stack(cfn, "cfn-iot-pol-ren")["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.update_stack(StackName="cfn-iot-pol-ren", TemplateBody=template("cfn-pol-after"))
+    stack = _wait_stack(cfn, "cfn-iot-pol-ren")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    ) == "cfn-pol-after"
+
+    assert iot_client.get_policy(policyName="cfn-pol-after")["policyName"] == "cfn-pol-after"
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.get_policy(policyName="cfn-pol-before")
+
+    cfn.delete_stack(StackName="cfn-iot-pol-ren")
+    _wait_stack(cfn, "cfn-iot-pol-ren")
+
+
 def test_cfn_lambda_layer_version_permission(cfn, lam):
     """AWS::Lambda::LayerVersionPermission attaches a statement to the real
     layer version's policy, readable via GetLayerVersionPolicy. (#1345, item 5)"""

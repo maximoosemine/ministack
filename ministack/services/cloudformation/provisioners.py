@@ -5614,14 +5614,39 @@ def _iot_thing_type_delete(physical_id, props):
     _iot._thing_types.pop(physical_id, None)
 
 
+def _iot_policy_document(props):
+    doc = props.get("PolicyDocument")
+    return json.dumps(doc) if isinstance(doc, (dict, list)) else doc
+
+
 def _iot_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id)
-    doc = props.get("PolicyDocument")
-    if isinstance(doc, (dict, list)):
-        doc = json.dumps(doc)
-    resp = _iot._create_policy(name, {"policyDocument": doc})
+    resp = _iot._create_policy(name, {"policyDocument": _iot_policy_document(props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::Policy create failed: {resp[2]!r}")
+    return name, {"Arn": _iot._policy_arn(name), "Id": name}
+
+
+def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Apply a policy change in place, the way CloudFormation does.
+
+    A new ``PolicyDocument`` is a no-interruption update: IoT stores it as a new
+    version and makes it the default, so ``Ref`` keeps naming the same policy.
+    Renaming is a replacement — the new policy is created and the old one
+    removed, since a policy no template still declares is not left behind.
+    """
+    name = new_props.get("PolicyName") or _physical_name(
+        stack_name, logical_id or physical_id
+    )
+    if name != physical_id:
+        created = _iot_policy_create(logical_id or physical_id, new_props, stack_name)
+        _iot_policy_delete(physical_id, old_props)
+        return created
+    resp = _iot._create_policy_version(
+        name, {"policyDocument": _iot_policy_document(new_props)}, {"setAsDefault": "true"}
+    )
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Policy update failed: {resp[2]!r}")
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
 
 
@@ -5862,7 +5887,12 @@ _RESOURCE_HANDLERS = {
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
     "AWS::IoT::TopicRule": {"create": _iot_topic_rule_create, "delete": _iot_topic_rule_delete},
     "AWS::IoT::ThingType": {"create": _iot_thing_type_create, "delete": _iot_thing_type_delete},
-    "AWS::IoT::Policy": {"create": _iot_policy_create, "delete": _iot_policy_delete},
+    "AWS::IoT::Policy": {
+        "create": _iot_policy_create,
+        "update": _iot_policy_update,
+        "update_with_logical_id": True,
+        "delete": _iot_policy_delete,
+    },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,
         "delete": _cognito_identity_pool_role_attachment_delete,
