@@ -589,6 +589,37 @@ def test_cfn_iot_policy_document_update_applies_in_place(cfn, iot_client):
     _wait_stack(cfn, "cfn-iot-pol-upd")
 
 
+def test_cfn_iot_policy_updates_stay_under_the_version_cap(cfn, iot_client):
+    """IoT keeps at most five versions of a policy, so repeated updates prune the
+    oldest non-default version rather than growing the list without bound."""
+    def template(count):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": "cfn-pol-cap",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "iot:Connect",
+                     "Resource": [f"arn:aws:iot:*:*:client/c{i}" for i in range(count)]}]}}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-pol-cap", TemplateBody=template(1))
+    assert _wait_stack(cfn, "cfn-iot-pol-cap")["StackStatus"] == "CREATE_COMPLETE"
+
+    for count in range(2, 9):
+        cfn.update_stack(StackName="cfn-iot-pol-cap", TemplateBody=template(count))
+        assert _wait_stack(cfn, "cfn-iot-pol-cap")["StackStatus"] == "UPDATE_COMPLETE"
+
+    versions = iot_client.list_policy_versions(policyName="cfn-pol-cap")["policyVersions"]
+    assert len(versions) == 5
+    assert {v["versionId"] for v in versions} == {"4", "5", "6", "7", "8"}
+
+    policy = iot_client.get_policy(policyName="cfn-pol-cap")
+    assert policy["defaultVersionId"] == "8"
+    assert len(json.loads(policy["policyDocument"])["Statement"][0]["Resource"]) == 8
+
+    cfn.delete_stack(StackName="cfn-iot-pol-cap")
+    _wait_stack(cfn, "cfn-iot-pol-cap")
+
+
 def test_cfn_iot_policy_rename_replaces_the_policy(cfn, iot_client):
     """Renaming is a replacement — the new policy exists under the new name and
     the old one does not survive the update."""

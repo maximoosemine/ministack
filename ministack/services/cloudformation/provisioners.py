@@ -5619,6 +5619,32 @@ def _iot_policy_document(props):
     return json.dumps(doc) if isinstance(doc, (dict, list)) else doc
 
 
+_IOT_POLICY_VERSION_LIMIT = 5
+
+
+def _iot_policy_prune_versions(name):
+    """Make room for one more version, the way the CloudFormation handler does.
+
+    IoT caps a policy at five versions and ``CreatePolicyVersion`` answers
+    ``VersionsLimitExceeded`` once that is reached, so CloudFormation deletes
+    the oldest non-default versions before storing a new document. MiniStack
+    does not enforce the cap today; pruning here keeps the version list the
+    same shape it has on AWS either way.
+    """
+    resp = _iot._list_policy_versions(name)
+    if resp[0] >= 400:
+        return
+    versions = json.loads(resp[2])["policyVersions"]
+    surplus = len(versions) - _IOT_POLICY_VERSION_LIMIT + 1
+    if surplus <= 0:
+        return
+    prunable = sorted(
+        (v["versionId"] for v in versions if not v["isDefaultVersion"]), key=int
+    )
+    for version_id in prunable[:surplus]:
+        _iot._delete_policy_version(name, version_id)
+
+
 def _iot_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id)
     resp = _iot._create_policy(name, {"policyDocument": _iot_policy_document(props)})
@@ -5642,6 +5668,7 @@ def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id
         created = _iot_policy_create(logical_id or physical_id, new_props, stack_name)
         _iot_policy_delete(physical_id, old_props)
         return created
+    _iot_policy_prune_versions(name)
     resp = _iot._create_policy_version(
         name, {"policyDocument": _iot_policy_document(new_props)}, {"setAsDefault": "true"}
     )
