@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudFormation — `Fn::Sub` honors the `${!Literal}` escape** — the leading `!` was not recognized, so the name fell through every lookup and rendered as `!Literal` with the braces consumed; `${!Literal}` now renders as the literal `${Literal}` and no longer registers a dependency on a resource of that name. An `AWS::IoT::Policy` pinned to `${!iot:Connection.Thing.ThingName}` deployed with a document matching nothing, so the policy denied every connect, publish and subscribe while the stack still reported `CREATE_COMPLETE`. Reported by @iot-rocket.
+
 ## [1.5.0] — 2026-08-23
 
 ### Added
