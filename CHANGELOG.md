@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **API Gateway — an OpenAPI body's `securityDefinitions` reach the methods** — the import discarded security outright, so a SAM API declaring a Cognito authorizer created none and every method imported as `authorizationType: NONE`, serving anonymous callers where AWS answers 401. Each scheme carrying `x-amazon-apigateway-authorizer` now becomes an authorizer, and an operation's `security` — or the document's — sets the method's `authorizationType`, `authorizerId` and `authorizationScopes`, so the enforcement added in 1.5.10 engages for body-defined APIs.
+
 ## [1.5.14] — 2026-09-20
 
 ### Added
