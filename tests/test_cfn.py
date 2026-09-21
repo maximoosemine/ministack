@@ -12599,6 +12599,180 @@ def test_cfn_apigateway_stage_ref_returns_stage_name(cfn, apigw_v1):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_stage_method_settings_become_a_map(cfn, apigw_v1):
+    """MethodSettings is a list in CloudFormation and a map on the stage.
+
+    Regression for the 1.5.14 outage: the list was stored verbatim, so the
+    throttling lookup on the request path raised and every method answered 500.
+    """
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-method-settings-{suffix}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"method-settings-{suffix}"},
+            },
+            "MockResource": {
+                "Type": "AWS::ApiGateway::Resource",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ParentId": {"Fn::GetAtt": ["Api", "RootResourceId"]},
+                    "PathPart": "mock",
+                },
+            },
+            "MockMethod": {
+                "Type": "AWS::ApiGateway::Method",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ResourceId": {"Ref": "MockResource"},
+                    "HttpMethod": "GET",
+                    "AuthorizationType": "NONE",
+                    "Integration": {"Type": "MOCK"},
+                },
+            },
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "DependsOn": "MockMethod",
+                "Properties": {"RestApiId": {"Ref": "Api"}},
+            },
+            "Stage": {
+                "Type": "AWS::ApiGateway::Stage",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "DeploymentId": {"Ref": "Deployment"},
+                    "StageName": "prod",
+                    "MethodSettings": [
+                        {
+                            "ResourcePath": "/*",
+                            "HttpMethod": "*",
+                            "LoggingLevel": "INFO",
+                            "MetricsEnabled": True,
+                        },
+                        {
+                            "ResourcePath": "/mock",
+                            "HttpMethod": "GET",
+                            "ThrottlingBurstLimit": 11,
+                            "ThrottlingRateLimit": 7,
+                            "CachingEnabled": "false",
+                            "CacheTtlInSeconds": "60",
+                        },
+                    ],
+                },
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}[
+            "ApiId"
+        ]
+
+        settings = apigw_v1.get_stage(restApiId=api_id, stageName="prod")[
+            "methodSettings"
+        ]
+        assert set(settings) == {"*/*", "/mock/GET"}
+        assert settings["*/*"] == {
+            "metricsEnabled": True,
+            "loggingLevel": "INFO",
+            "dataTraceEnabled": False,
+            "throttlingBurstLimit": 5000,
+            "throttlingRateLimit": 10000.0,
+            "cachingEnabled": False,
+            "cacheTtlInSeconds": 300,
+            "cacheDataEncrypted": False,
+            "requireAuthorizationForCacheControl": True,
+            "unauthorizedCacheControlHeaderStrategy": "SUCCEED_WITH_RESPONSE_HEADER",
+        }
+        # Each property is typed by its shape, not by how the template spelled
+        # it: a stringly-typed template value lands as the bool or int AWS reports.
+        per_method = settings["/mock/GET"]
+        assert per_method["throttlingBurstLimit"] == 11
+        assert isinstance(per_method["throttlingRateLimit"], float)
+        assert per_method["throttlingRateLimit"] == 7.0
+        assert per_method["cachingEnabled"] is False
+        assert per_method["cacheTtlInSeconds"] == 60
+        assert per_method["loggingLevel"] == "OFF"
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/prod/mock",
+            method="GET",
+            headers={"Host": f"{api_id}.execute-api.localhost:{port}"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_stage_method_settings_update_in_place(cfn, apigw_v1):
+    """A changed MethodSettings list reaches the stage through UpdateStage as a
+    map, not as the raw CloudFormation list."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-method-settings-upd-{suffix}"
+
+    def _template(logging_level):
+        return json.dumps({
+            "Resources": {
+                "Api": {
+                    "Type": "AWS::ApiGateway::RestApi",
+                    "Properties": {"Name": f"method-settings-upd-{suffix}"},
+                },
+                "Deployment": {
+                    "Type": "AWS::ApiGateway::Deployment",
+                    "Properties": {"RestApiId": {"Ref": "Api"}},
+                },
+                "Stage": {
+                    "Type": "AWS::ApiGateway::Stage",
+                    "Properties": {
+                        "RestApiId": {"Ref": "Api"},
+                        "DeploymentId": {"Ref": "Deployment"},
+                        "StageName": "prod",
+                        "MethodSettings": [
+                            {
+                                "ResourcePath": "/*",
+                                "HttpMethod": "*",
+                                "LoggingLevel": logging_level,
+                            },
+                        ],
+                    },
+                },
+            },
+            "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_template("ERROR"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}[
+            "ApiId"
+        ]
+        settings = apigw_v1.get_stage(restApiId=api_id, stageName="prod")[
+            "methodSettings"
+        ]
+        assert settings["*/*"]["loggingLevel"] == "ERROR"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_template("INFO"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        settings = apigw_v1.get_stage(restApiId=api_id, stageName="prod")[
+            "methodSettings"
+        ]
+        assert set(settings) == {"*/*"}
+        assert settings["*/*"]["loggingLevel"] == "INFO"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_rest_api_tracks_stack_region(cfn, apigw_v1):
     """A v1 REST API created by a regional stack is scoped to that region, while
     unsigned execute-api data-plane requests still resolve by API id."""
