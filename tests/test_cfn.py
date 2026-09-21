@@ -13583,6 +13583,203 @@ def test_cfn_restapi_openapi_body_petstore(cfn, apigw_v1):
     assert api_id not in ids
 
 
+def test_cfn_restapi_openapi_body_security_definitions(cfn, apigw_v1, cognito_idp):
+    """securityDefinitions in a RestApi Body create authorizers and bind methods.
+
+    This is the only mechanism by which SAM's Auth property reaches a method —
+    the translator emits no AWS::ApiGateway::Authorizer resource — so before
+    this the method imported as authorizationType NONE and served everyone.
+    """
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-restapi-security-{suffix}"
+
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-body-{suffix}")["UserPool"]["Id"]
+    pool_region = pool_id.split("_")[0]
+    pool_arn = f"arn:aws:cognito-idp:{pool_region}:000000000000:userpool/{pool_id}"
+
+    mock = {
+        "x-amazon-apigateway-integration": {"type": "mock", "httpMethod": "GET"},
+        "responses": {},
+    }
+    body = {
+        "swagger": "2.0",
+        "info": {"version": "1.0", "title": f"security-{suffix}"},
+        "securityDefinitions": {
+            "CognitoAuthorizer": {
+                "in": "header",
+                "type": "apiKey",
+                "name": "Authorization",
+                "x-amazon-apigateway-authtype": "cognito_user_pools",
+                "x-amazon-apigateway-authorizer": {
+                    "type": "cognito_user_pools",
+                    "providerARNs": [pool_arn],
+                },
+            },
+            "LambdaAuthorizer": {
+                "in": "header",
+                "type": "apiKey",
+                "name": "X-Token",
+                "x-amazon-apigateway-authtype": "custom",
+                "x-amazon-apigateway-authorizer": {
+                    "type": "token",
+                    "authorizerUri": (
+                        "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/"
+                        "functions/arn:aws:lambda:us-east-1:000000000000:"
+                        "function:noop/invocations"
+                    ),
+                    "authorizerResultTtlInSeconds": 60,
+                },
+            },
+        },
+        "paths": {
+            "/devices": {
+                "get": dict(mock, security=[{"CognitoAuthorizer": ["devices/read"]}]),
+            },
+            "/tokens": {"get": dict(mock, security=[{"LambdaAuthorizer": []}])},
+            "/open": {"get": dict(mock)},
+        },
+    }
+    template = json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Body": body}},
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "Properties": {"RestApiId": {"Ref": "Api"}, "StageName": "prod"},
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ApiId"]
+
+        authorizers = {
+            a["name"]: a for a in apigw_v1.get_authorizers(restApiId=api_id)["items"]
+        }
+        assert set(authorizers) == {"CognitoAuthorizer", "LambdaAuthorizer"}
+        cognito_auth = authorizers["CognitoAuthorizer"]
+        assert cognito_auth["type"] == "COGNITO_USER_POOLS"
+        assert cognito_auth["providerARNs"] == [pool_arn]
+        assert cognito_auth["identitySource"] == "method.request.header.Authorization"
+        assert cognito_auth["authType"] == "cognito_user_pools"
+        lambda_auth = authorizers["LambdaAuthorizer"]
+        assert lambda_auth["type"] == "TOKEN"
+        assert lambda_auth["identitySource"] == "method.request.header.X-Token"
+        assert lambda_auth["authorizerResultTtlInSeconds"] == 60
+
+        resources = {
+            r["path"]: r["id"]
+            for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]
+        }
+        devices = apigw_v1.get_method(
+            restApiId=api_id, resourceId=resources["/devices"], httpMethod="GET",
+        )
+        assert devices["authorizationType"] == "COGNITO_USER_POOLS"
+        assert devices["authorizerId"] == cognito_auth["id"]
+        assert devices["authorizationScopes"] == ["devices/read"]
+
+        tokens = apigw_v1.get_method(
+            restApiId=api_id, resourceId=resources["/tokens"], httpMethod="GET",
+        )
+        assert tokens["authorizationType"] == "CUSTOM"
+        assert tokens["authorizerId"] == lambda_auth["id"]
+
+        open_method = apigw_v1.get_method(
+            restApiId=api_id, resourceId=resources["/open"], httpMethod="GET",
+        )
+        assert open_method["authorizationType"] == "NONE"
+
+        def _call(path):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/prod{path}",
+                method="GET",
+                headers={"Host": f"{api_id}.execute-api.localhost:{port}"},
+            )
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as exc:
+                return exc.code
+
+        # The gap this closes: both of these previously answered 200.
+        assert _call("/devices") == 401
+        assert _call("/tokens") == 401
+        assert _call("/open") == 200
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_restapi_openapi_body_document_level_security(cfn, apigw_v1):
+    """A document-level security block applies to every operation that does not
+    override it, and an operation's empty security list opts back out."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-restapi-security-doc-{suffix}"
+    mock = {
+        "x-amazon-apigateway-integration": {"type": "mock", "httpMethod": "GET"},
+        "responses": {},
+    }
+    body = {
+        "swagger": "2.0",
+        "info": {"version": "1.0", "title": f"security-doc-{suffix}"},
+        "securityDefinitions": {
+            "sigv4": {
+                "in": "header",
+                "type": "apiKey",
+                "name": "Authorization",
+                "x-amazon-apigateway-authtype": "awsSigv4",
+            },
+            "api_key": {"in": "header", "type": "apiKey", "name": "x-api-key"},
+        },
+        "security": [{"sigv4": []}],
+        "paths": {
+            "/inherited": {"get": dict(mock)},
+            "/keyed": {"get": dict(mock, security=[{"api_key": []}])},
+            "/public": {"get": dict(mock, security=[])},
+        },
+    }
+    template = json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Body": body}},
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ApiId"]
+
+        # Neither scheme carries x-amazon-apigateway-authorizer, so no authorizer.
+        assert apigw_v1.get_authorizers(restApiId=api_id)["items"] == []
+
+        resources = {
+            r["path"]: r["id"]
+            for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]
+        }
+
+        def _method(path):
+            return apigw_v1.get_method(
+                restApiId=api_id, resourceId=resources[path], httpMethod="GET",
+            )
+
+        assert _method("/inherited")["authorizationType"] == "AWS_IAM"
+        keyed = _method("/keyed")
+        assert keyed["authorizationType"] == "NONE"
+        assert keyed["apiKeyRequired"] is True
+        assert _method("/public")["authorizationType"] == "NONE"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 # ============================================================================
 # Nested Stacks (AWS::CloudFormation::Stack)
 # ============================================================================
