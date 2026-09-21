@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **CloudFormation — `AWS::ApiGateway::Stage` method settings reach the stage as a map** — the template's `MethodSettings` list was stored verbatim, so the throttling lookup added in 1.5.14 raised on it and every request to a CloudFormation- or SAM-deployed API answered 500. The list is now keyed `"<resourcePath>/<httpMethod>"`, `"*/*"` for the stage-wide entry, over the account-level defaults AWS reports from `GetStage`.
+
 ## [1.5.14] — 2026-09-20
 
 ### Added
