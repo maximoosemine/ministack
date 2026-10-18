@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **End User Messaging SMS** — `pinpoint-sms-voice-v2` `RequestPhoneNumber` for `SIMULATOR` numbers, `DescribePhoneNumbers`, `ReleasePhoneNumber`, `CreateConfigurationSet`, `DescribeConfigurationSets`, `DeleteConfigurationSet`, `CreateEventDestination`, `UpdateEventDestination`, `DeleteEventDestination` and `SendTextMessage`, per account and region. A sent message goes nowhere, but each enabled CloudWatch Logs event destination whose `MatchingEventTypes` cover it gets a `TEXT_SUCCESSFUL` and a final `TEXT_DELIVERED` record in the documented event format, with the message's `context`, so tests can read what was sent. Releasing a protected number answers `ConflictException` (`DELETION_PROTECTION_ENABLED`), a sixth event destination `ServiceQuotaExceededException` and a `TEXT_SENT` event type `ValidationException`. CloudFormation creates, updates and deletes `AWS::SMSVOICE::PhoneNumber` (`Ref` is the `PhoneNumberId`; `Arn`, `PhoneNumber` and `PhoneNumberId` attributes) and `AWS::SMSVOICE::ConfigurationSet` with its `EventDestinations` (`Ref` is the name; `Arn` attribute).
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

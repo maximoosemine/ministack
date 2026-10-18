@@ -1169,6 +1169,8 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::DocDB::DBSubnetGroup": ("Tags", "list"),
     "AWS::DocDB::DBClusterParameterGroup": ("Tags", "list"),
     "AWS::SES::ConfigurationSet": ("Tags", "list"),
+    "AWS::SMSVOICE::ConfigurationSet": ("Tags", "list"),
+    "AWS::SMSVOICE::PhoneNumber": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
     "AWS::SSM::Parameter": ("Tags", "map"),
@@ -14584,6 +14586,117 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
+# --- End User Messaging SMS (AWS::SMSVOICE::PhoneNumber, ConfigurationSet) ---
+
+def _smsvoice_body(resp, resource_type, action):
+    if resp[0] >= 400:
+        raise ValueError(f"{resource_type} {action} failed: {json.loads(resp[2]).get('Message')}")
+    return json.loads(resp[2])
+
+
+def _smsvoice_phone_number_attrs(rec):
+    return {"Arn": rec["PhoneNumberArn"], "PhoneNumber": rec["PhoneNumber"],
+            "PhoneNumberId": rec["PhoneNumberId"]}
+
+
+def _smsvoice_phone_number_options(props):
+    return {
+        "DeletionProtectionEnabled": _cfn_bool(props.get("DeletionProtectionEnabled", False)),
+        "SelfManagedOptOutsEnabled": _cfn_bool(props.get("SelfManagedOptOutsEnabled", False)),
+        "OptOutListName": props.get("OptOutListName") or "Default",
+    }
+
+
+def _smsvoice_phone_number_create(logical_id, props, stack_name):
+    """The template has no MessageType, which RequestPhoneNumber requires: TRANSACTIONAL is sent."""
+    import ministack.services.sms_voice as _sms
+    rec = _smsvoice_body(_sms.request_phone_number({
+        "IsoCountryCode": props.get("IsoCountryCode"),
+        "MessageType": "TRANSACTIONAL",
+        "NumberCapabilities": props.get("NumberCapabilities"),
+        "NumberType": props.get("NumberType"),
+        "Tags": [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()],
+    }), "AWS::SMSVOICE::PhoneNumber", "create")
+    _sms.update_phone_number(rec["PhoneNumberId"], _smsvoice_phone_number_options(props))
+    return rec["PhoneNumberId"], _smsvoice_phone_number_attrs(rec)
+
+
+def _smsvoice_phone_number_update(physical_id, old_props, new_props, stack_name):
+    """IsoCountryCode, NumberCapabilities and NumberType replace the number; the rest update in place."""
+    import ministack.services.sms_voice as _sms
+    rec = _sms._phone_numbers.get(physical_id)
+    if rec is None:
+        return _smsvoice_phone_number_create(physical_id, new_props, stack_name)
+    _sms.update_phone_number(physical_id, _smsvoice_phone_number_options(new_props))
+    _reconcile_tag_list(rec["Tags"], old_props, new_props)
+    return physical_id, _smsvoice_phone_number_attrs(rec)
+
+
+def _smsvoice_phone_number_delete(physical_id, props):
+    import ministack.services.sms_voice as _sms
+    if physical_id not in _sms._phone_numbers:
+        return
+    _smsvoice_body(_sms.release_phone_number({"PhoneNumberId": physical_id}),
+                   "AWS::SMSVOICE::PhoneNumber", "delete")
+
+
+def _smsvoice_event_destination(destination):
+    body = {
+        "EventDestinationName": destination.get("EventDestinationName"),
+        "MatchingEventTypes": destination.get("MatchingEventTypes") or [],
+    }
+    for key in ("CloudWatchLogsDestination", "KinesisFirehoseDestination", "SnsDestination"):
+        if isinstance(destination.get(key), dict):
+            body[key] = copy.deepcopy(destination[key])
+    return body
+
+
+def _smsvoice_configuration_set_apply(name, old_props, new_props):
+    import ministack.services.sms_voice as _sms
+    old = {d.get("EventDestinationName"): d for d in old_props.get("EventDestinations") or []}
+    new = {d.get("EventDestinationName"): d for d in new_props.get("EventDestinations") or []}
+    rec = _sms._configuration_sets[name]
+    for dest_name in old.keys() - new.keys():
+        rec["EventDestinations"].pop(dest_name, None)
+    for dest_name, destination in new.items():
+        body = {"ConfigurationSetName": name, **_smsvoice_event_destination(destination)}
+        if dest_name in rec["EventDestinations"]:
+            rec["EventDestinations"].pop(dest_name)
+        _smsvoice_body(_sms.create_event_destination(body), "AWS::SMSVOICE::ConfigurationSet", "update")
+        rec["EventDestinations"][dest_name]["Enabled"] = _cfn_bool(destination.get("Enabled", False))
+    feedback = new_props.get("MessageFeedbackEnabled")
+    _sms.update_configuration_set(name, {
+        "DefaultSenderId": new_props.get("DefaultSenderId"),
+        "DefaultMessageFeedbackEnabled": None if feedback is None else _cfn_bool(feedback),
+        "ProtectConfigurationId": new_props.get("ProtectConfigurationId"),
+    })
+    _reconcile_tag_list(rec["Tags"], old_props, new_props)
+
+
+def _smsvoice_configuration_set_create(logical_id, props, stack_name):
+    import ministack.services.sms_voice as _sms
+    name = props.get("ConfigurationSetName") or _physical_name(stack_name, logical_id, max_len=64)
+    rec = _smsvoice_body(_sms.create_configuration_set({"ConfigurationSetName": name}),
+                         "AWS::SMSVOICE::ConfigurationSet", "create")
+    _smsvoice_configuration_set_apply(name, {}, props)
+    return name, {"Arn": rec["ConfigurationSetArn"]}
+
+
+def _smsvoice_configuration_set_update(physical_id, old_props, new_props, stack_name):
+    """ConfigurationSetName replaces the set; event destinations, options and tags update in place."""
+    import ministack.services.sms_voice as _sms
+    rec = _sms._configuration_sets.get(physical_id)
+    if rec is None:
+        return _smsvoice_configuration_set_create(physical_id, new_props, stack_name)
+    _smsvoice_configuration_set_apply(physical_id, old_props, new_props)
+    return physical_id, {"Arn": rec["ConfigurationSetArn"]}
+
+
+def _smsvoice_configuration_set_delete(physical_id, props):
+    import ministack.services.sms_voice as _sms
+    _sms._configuration_sets.pop(physical_id, None)
+
+
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DocDB::DBCluster": ("AvailabilityZones", "DBClusterIdentifier", "DBSubnetGroupName", "KmsKeyId",
@@ -14616,6 +14729,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
+    "AWS::SMSVOICE::PhoneNumber": ("IsoCountryCode", "NumberCapabilities", "NumberType"),
+    "AWS::SMSVOICE::ConfigurationSet": ("ConfigurationSetName",),
     "AWS::S3::MultiRegionAccessPoint": ("Name", "PublicAccessBlockConfiguration", "Regions"),
     "AWS::S3::AccessPoint": ("Bucket", "BucketAccountId", "Name", "VpcConfiguration"),
     "AWS::S3ObjectLambda::AccessPoint": ("Name",),
@@ -15674,6 +15789,17 @@ _RESOURCE_HANDLERS = {
         "update": _location_tracker_update,
         "update_with_logical_id": True,
         "delete": _location_tracker_delete,
+    },
+    # End User Messaging SMS
+    "AWS::SMSVOICE::PhoneNumber": {
+        "create": _smsvoice_phone_number_create,
+        "update": _smsvoice_phone_number_update,
+        "delete": _smsvoice_phone_number_delete,
+    },
+    "AWS::SMSVOICE::ConfigurationSet": {
+        "create": _smsvoice_configuration_set_create,
+        "update": _smsvoice_configuration_set_update,
+        "delete": _smsvoice_configuration_set_delete,
     },
     # EKS
     "AWS::EKS::Cluster": {

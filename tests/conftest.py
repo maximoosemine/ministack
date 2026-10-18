@@ -946,6 +946,11 @@ def budgets():
 
 
 @pytest.fixture(scope="session")
+def sms_voice():
+    return make_client("pinpoint-sms-voice-v2")
+
+
+@pytest.fixture(scope="session")
 def kinesisanalyticsv2():
     return make_client("kinesisanalyticsv2")
 

@@ -43,6 +43,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "bedrock-agentcore": "bedrock-agentcore",
     "bedrock-runtime": "bedrock",
     "budgets": "budgets",
+    "sms-voice": "sms-voice",
     "cloudcontrol": "cloudformation",
     "cloudformation": "cloudformation",
     "cloudfront": "cloudfront",

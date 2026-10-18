@@ -655,6 +655,7 @@ fs.write = function(fd, ...args) {
     "@aws-sdk/client-resource-groups-tagging-api": "ResourceGroupsTaggingAPI_20170126",
     "@aws-sdk/client-cloudtrail":                  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
     "@aws-sdk/client-translate":                   "AWSShineFrontendService_20170701",
+    "@aws-sdk/client-pinpoint-sms-voice-v2":       "PinpointSMSVoiceV2",
   };
 
   function _jsonRpcRequest(targetPrefix, opName, params) {

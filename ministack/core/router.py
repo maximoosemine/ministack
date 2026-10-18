@@ -532,6 +532,11 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"budgets\."],
         "credential_scope": "budgets",
     },
+    "sms-voice": {
+        "target_prefixes": ["PinpointSMSVoiceV2"],
+        "host_patterns": [r"sms-voice\."],
+        "credential_scope": "sms-voice",
+    },
     # Managed Service for Apache Flink. The v1 API (KinesisAnalytics_20150814)
     # shares the `kinesisanalytics` signing name and is not implemented, so
     # requests route on the v2 target prefix.
